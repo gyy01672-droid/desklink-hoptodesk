@@ -91,6 +91,10 @@ jobs:
           $result = & $exe --version | Out-String
           if ($LASTEXITCODE -ne 0 -or $result -notmatch '1\.46\.88') {throw "Version check failed: $result"}
           (Get-FileHash $exe).Hash
+      - name: Exercise the Windows QoS regression cases
+        working-directory: upstream/hoptodesk
+        shell: pwsh
+        run: cargo test --locked --release --lib --features packui,nativecodec server::video_qos::tests::
       - uses: actions/upload-artifact@v4
         if: ${{ hashFiles('windows-native/performance.patch') != '' }}
         with:
