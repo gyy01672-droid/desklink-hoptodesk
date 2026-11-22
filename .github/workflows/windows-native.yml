@@ -101,6 +101,13 @@ jobs:
         working-directory: upstream/hoptodesk
         shell: pwsh
         run: cargo build --locked --release --bin hoptodesk --features packui,nativecodec
+      - name: Preserve the native build for verification
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-before-verification
+          path: upstream/hoptodesk/target/release/hoptodesk.exe
+          if-no-files-found: error
+          retention-days: 2
       - name: Check version without starting a remote session
         shell: pwsh
         run: |

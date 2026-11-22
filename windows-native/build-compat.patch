@@ -27,3 +27,9 @@ diff --git a/src/lib.rs b/src/lib.rs
  #[cfg(feature = "fips")]
  pub mod fips;
  #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
+diff --git a/custom-client.json b/custom-client.json
+new file mode 100644
+--- /dev/null
++++ b/custom-client.json
+@@ -0,0 +1 @@
++{}
