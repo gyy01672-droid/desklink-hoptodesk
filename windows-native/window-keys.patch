@@ -1,0 +1,359 @@
+diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
+index 9fff00a..c69b9ef 100644
+--- a/src/client/io_loop.rs
++++ b/src/client/io_loop.rs
+@@ -211,6 +211,8 @@ impl<T: InvokeUiSession> Remote<T> {
+ 
+         self.handler.update_direct(None);
+         self.handler.update_received(false);
++        #[cfg(all(windows, not(any(feature = "flutter", feature = "cli"))))]
++        self.handler.forget_held_window_keys();
+ 
+         let conn_type = if self.handler.is_file_transfer() {
+             ConnType::FILE_TRANSFER
+diff --git a/src/lang/cn.rs b/src/lang/cn.rs
+index d649784..6d3a807 100644
+--- a/src/lang/cn.rs
++++ b/src/lang/cn.rs
+@@ -146,6 +146,11 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("Show remote cursor", "显示远程光标"),
+         ("Show quality monitor", "显示质量监测"),
+         ("Copy performance diagnostics", "复制性能诊断"),
++        ("Swap two keys in this window", "当前窗口按键互换"),
++        ("Choose Remote layout to swap physical keys.", "请先选择远程布局，再设置按键互换。"),
++        ("Choose two different keys. Select Off to restore the original keys.", "选择两枚要互换的按键。选择关闭可恢复原键位。"),
++        ("Choose two different keys.", "请选择两个不同的键。"),
++        ("Release held keys and try again.", "请松开按住的键再试。"),
+         ("Session performance", "本次会话性能"),
+         ("Connection path", "连接线路"),
+         ("Host measured round-trip time", "被控端测得的往返延迟"),
+diff --git a/src/ui/common.tis b/src/ui/common.tis
+index d62ed79..8472e4d 100644
+--- a/src/ui/common.tis
++++ b/src/ui/common.tis
+@@ -343,7 +343,7 @@ function msgbox(type, title, content, link="", callback=null, height=180, width=
+ 	
+     if (type.indexOf("custom") < 0) {
+         var needs_local_typing = type.indexOf("input-password") >= 0 || type.indexOf("input-2fa") >= 0
+-            || type.indexOf("session-login") >= 0 || type == "session-re-login";
++            || type.indexOf("session-login") >= 0 || type == "session-re-login" || type == "custom-window-keys";
+         try { handler.set_dialog_key_pause(needs_local_typing); } catch (e) {}
+     }
+ 
+diff --git a/src/ui/header.tis b/src/ui/header.tis
+index 236cf5a..f402bd3 100644
+--- a/src/ui/header.tis
++++ b/src/ui/header.tis
+@@ -267,6 +267,8 @@ class Header: Reactor.Component {
+                 <li #auto>{translate('Auto')}</li>
+                 { is_map_mode_supported && <li #map>{translate('Remote layout')}</li> }
+                 { is_translate_mode_supported && <li #translate>{translate('My layout')}</li> }
++                { is_win && keyboard_enabled && pi.platform == "Windows" && is_map_mode_supported &&
++                    <li #window-key-pair>{translate("Swap two keys in this window")}</li> }
+             </menu>;
+     }
+ 
+@@ -677,11 +679,44 @@ class Header: Reactor.Component {
+     }
+ 
+     event click $(menu#keyboard-options>li) (_, me) {
++        if (me.id == "window-key-pair") {
++            editWindowKeyPair();
++            return;
++        }
+         handler.save_keyboard_mode(me.id);
+         toggleMenuState();
+     }
+ }
+ 
++function windowKeyChoices(current) {
++    var scans = [0, 1, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88];
++    var options = "";
++    for (var i = 0; i < scans.length; i++) {
++        var label = i == 0 ? translate("Off") : (i == 1 ? "Esc" : "F" + (i - 1));
++        options += "<option value='" + scans[i] + "'" + (scans[i] == current ? " selected" : "") + ">" + label + "</option>";
++    }
++    return options;
++}
++
++function editWindowKeyPair() {
++    if (handler.get_keyboard_mode() != "map") {
++        showSessionToast(translate("Choose Remote layout to swap physical keys."), 2600ms);
++        return;
++    }
++    var pair = handler.get_window_key_selection();
++    var content = "<div class='form'><div>" + translate("Choose two different keys. Select Off to restore the original keys.") + "</div>" +
++        "<div><select name='first'>" + windowKeyChoices(pair[0]) + "</select> ↔ <select name='second'>" +
++        windowKeyChoices(pair[1]) + "</select></div></div>";
++    msgbox("custom-window-keys", "Swap two keys in this window", content, "", function(res=null) {
++        if (!res) return;
++        var a = "" + res.first;
++        var b = "" + res.second;
++        if (a == "0" || b == "0") { a = "0"; b = "0"; }
++        if (a != "0" && a == b) return translate("Choose two different keys.");
++        if (!handler.set_window_key_selection(a, b)) return translate("Release held keys and try again.");
++    });
++}
++
+ function showPrinterDialog() {
+     var defaultPrinter = "";
+     try { defaultPrinter = handler.get_default_printer(); } catch(e) {}
+diff --git a/src/ui/remote.rs b/src/ui/remote.rs
+index 2528043..44aa0be 100644
+--- a/src/ui/remote.rs
++++ b/src/ui/remote.rs
+@@ -977,6 +977,8 @@ impl wireui::EventHandler for RemoteSession {
+         fn peer_platform();
+         fn set_write_override(i32, i32, bool, bool, bool);
+         fn get_keyboard_mode();
++        fn get_window_key_selection();
++        fn set_window_key_selection(String, String);
+         fn get_raw_keyboard_mode();
+         fn is_keyboard_mode_supported(String);
+         fn save_keyboard_mode(String);
+@@ -1112,6 +1114,21 @@ impl RemoteSession {
+         super::copy_text(&report)
+     }
+ 
++    fn get_window_key_selection(&self) -> Value {
++        #[cfg(windows)]
++        return self.session.window_key_selection().into_iter().collect();
++        #[cfg(not(windows))]
++        Value::array(0)
++    }
++
++    fn set_window_key_selection(&self, first: String, second: String) -> bool {
++        #[cfg(windows)]
++        if let (Ok(a), Ok(b)) = (first.parse::<u32>(), second.parse::<u32>()) {
++            return self.session.select_window_keys(a, b);
++        }
++        false
++    }
++
+     fn type_clipboard(&self) {
+         let text = arboard::Clipboard::new()
+             .and_then(|mut c| c.get_text())
+diff --git a/src/ui_session_interface.rs b/src/ui_session_interface.rs
+index d3ae519..aede62b 100644
+--- a/src/ui_session_interface.rs
++++ b/src/ui_session_interface.rs
+@@ -48,6 +48,9 @@ use crate::common::GrabState;
+ use crate::keyboard;
+ use crate::{client::Data, client::Interface};
+ 
++#[cfg(all(windows, not(any(feature = "flutter", feature = "cli"))))]
++pub(crate) mod window_keys;
++
+ // Storage for pending print jobs during printer selection dialog
+ lazy_static::lazy_static! {
+     static ref PENDING_PRINT_JOBS: Mutex<HashMap<i32, Vec<u8>>> = Mutex::new(HashMap::new());
+@@ -94,6 +97,8 @@ const CHANGE_RESOLUTION_VALID_TIMEOUT_SECS: u64 = 15;
+ 
+ #[derive(Clone, Default)]
+ pub struct Session<T: InvokeUiSession> {
++    #[cfg(all(windows, not(any(feature = "flutter", feature = "cli"))))]
++    pub(crate) window_keys: Arc<Mutex<window_keys::WindowKeys>>,
+     pub id: String, // peer id
+     pub password: String,
+ 	pub tokenexp: String,
+@@ -378,6 +383,8 @@ impl<T: InvokeUiSession> Session<T> {
+     }
+ 
+     pub fn save_keyboard_mode(&self, value: String) {
++        #[cfg(all(windows, not(any(feature = "flutter", feature = "cli"))))]
++        self.release_window_keys();
+         self.lc.write().unwrap().save_keyboard_mode(value);
+     }
+ 
+@@ -974,11 +981,58 @@ impl<T: InvokeUiSession> Session<T> {
+ 
+         let mut msg = evt.clone();
+         self.swap_modifier_key(&mut msg);
++        #[cfg(all(windows, not(any(feature = "flutter", feature = "cli"))))]
++        if msg.mode.enum_value_or_default() == KeyboardMode::Map && !msg.press
++            && window_keys::WindowKeys::eligible(msg.chr())
++        {
++            // Serialize the output with blur handling so a late key-down
++            // cannot overtake the corresponding synthetic release.
++            let mut keys = self.window_keys.lock().unwrap();
++            if let Some(sent) = keys.event(msg.chr(), msg.down, || {
++                !crate::kvm::is_on() && crate::platform::windows::is_foreground_window_ours()
++                    && self.get_keyboard_mode() == "map"
++            }) {
++                msg.set_chr(sent);
++                self.send_raw_key(msg);
++            }
++            return;
++        }
++        self.send_raw_key(msg);
++    }
++
++    fn send_raw_key(&self, msg: KeyEvent) {
+         let mut msg_out = Message::new();
+         msg_out.set_key_event(msg);
+         self.send(Data::Message(msg_out));
+     }
+ 
++    #[cfg(all(windows, not(any(feature = "flutter", feature = "cli"))))]
++    pub fn window_key_selection(&self) -> Vec<i32> {
++        self.window_keys.lock().unwrap().selection()
++    }
++
++    #[cfg(all(windows, not(any(feature = "flutter", feature = "cli"))))]
++    pub fn select_window_keys(&self, a: u32, b: u32) -> bool {
++        self.is_default() && self.peer_platform().eq_ignore_ascii_case("windows")
++            && self.window_keys.lock().unwrap().select(a, b)
++    }
++
++    #[cfg(all(windows, not(any(feature = "flutter", feature = "cli"))))]
++    pub fn forget_held_window_keys(&self) {
++        self.window_keys.lock().unwrap().reset_connection();
++    }
++
++    #[cfg(all(windows, not(any(feature = "flutter", feature = "cli"))))]
++    fn release_window_keys(&self) {
++        let mut keys = self.window_keys.lock().unwrap();
++        for code in keys.release_mapped() {
++            let mut up = KeyEvent::new();
++            up.mode = KeyboardMode::Map.into();
++            up.set_chr(code);
++            self.send_raw_key(up);
++        }
++    }
++
+     pub fn send_chat(&self, text: String) {
+         let mut misc = Misc::new();
+         misc.set_chat_message(ChatMessage {
+@@ -1078,6 +1132,8 @@ impl<T: InvokeUiSession> Session<T> {
+ 
+     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+     pub fn leave(&self, keyboard_mode: String) {
++        #[cfg(all(windows, not(any(feature = "flutter", feature = "cli"))))]
++        self.release_window_keys();
+         keyboard::client::change_grab_status(GrabState::Wait, &keyboard_mode);
+     }
+ 
+diff --git a/src/ui_session_interface/window_keys.rs b/src/ui_session_interface/window_keys.rs
+new file mode 100644
+index 0000000..f308c80
+--- /dev/null
++++ b/src/ui_session_interface/window_keys.rs
+@@ -0,0 +1,118 @@
++const SCANS: [u32; 13] = [0x01, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x57, 0x58];
++
++#[derive(Default)]
++pub(crate) struct WindowKeys {
++    pair: (u32, u32),
++    held: [Option<u32>; 13],
++    released_on_blur: [bool; 13],
++}
++
++impl WindowKeys {
++    pub(super) fn eligible(code: u32) -> bool {
++        SCANS.contains(&code)
++    }
++
++    pub(super) fn selection(&self) -> Vec<i32> {
++        vec![self.pair.0 as i32, self.pair.1 as i32]
++    }
++
++    pub(super) fn select(&mut self, a: u32, b: u32) -> bool {
++        let pair = if (a, b) == (0, 0) || (Self::eligible(a) && Self::eligible(b) && a != b) {
++            (a, b)
++        } else {
++            return false;
++        };
++        if self.pair != pair && self.held.iter().any(Option::is_some) {
++            return false;
++        }
++        self.pair = pair;
++        true
++    }
++
++    pub(super) fn event(&mut self, code: u32, down: bool, in_window: impl FnOnce() -> bool) -> Option<u32> {
++        let Some(i) = SCANS.iter().position(|&key| key == code) else { return Some(code) };
++        if !down {
++            if let Some(sent) = self.held[i].take() {
++                return Some(sent);
++            }
++            return (!std::mem::take(&mut self.released_on_blur[i])).then_some(code);
++        }
++        if let Some(sent) = self.held[i] {
++            return (sent == code || in_window()).then_some(sent);
++        }
++        let (a, b) = self.pair;
++        let mapped = if code == a { b } else if code == b { a } else { code };
++        let sent = if mapped != code && in_window() { mapped } else { code };
++        self.released_on_blur[i] = false;
++        self.held[i] = Some(sent);
++        Some(sent)
++    }
++
++    pub(super) fn release_mapped(&mut self) -> Vec<u32> {
++        let mut release = Vec::new();
++        for (i, code) in SCANS.iter().enumerate() {
++            if let Some(sent) = self.held[i].take() {
++                if sent != *code {
++                    release.push(sent);
++                    self.released_on_blur[i] = true;
++                }
++            }
++        }
++        release
++    }
++
++    pub(super) fn reset_connection(&mut self) {
++        self.held.fill(None);
++        self.released_on_blur.fill(false);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn pairs_swap_each_down_repeat_and_up_and_do_not_change_while_held() {
++        let mut keys = WindowKeys::default();
++        for a in SCANS {
++            for b in SCANS {
++                if a == b { continue; }
++                assert!(keys.select(a, b));
++                assert_eq!(keys.event(a, true, || true), Some(b));
++                assert_eq!(keys.event(a, true, || true), Some(b));
++                assert_eq!(keys.event(b, true, || true), Some(a));
++                assert!(!keys.select(0, 0));
++                assert_eq!(keys.event(b, false, || false), Some(a));
++                assert_eq!(keys.event(a, false, || false), Some(b));
++            }
++        }
++    }
++
++    #[test]
++    fn blur_releases_the_sent_key_once_and_a_new_press_is_independent() {
++        let mut keys = WindowKeys::default();
++        assert!(keys.select(1, 0x3b));
++        assert_eq!(keys.event(1, true, || true), Some(0x3b));
++        assert_eq!(keys.release_mapped(), vec![0x3b]);
++        assert!(keys.release_mapped().is_empty());
++        assert_eq!(keys.event(1, false, || false), None);
++        assert_eq!(keys.event(1, true, || false), Some(1));
++        assert_eq!(keys.event(1, false, || true), Some(1));
++        assert_eq!(keys.event(1, true, || true), Some(0x3b));
++        keys.reset_connection();
++        assert!(keys.release_mapped().is_empty());
++        assert_eq!(keys.selection(), vec![1, 0x3b]);
++    }
++
++    #[test]
++    fn default_typing_locks_and_modifiers_pass_through() {
++        let mut keys = WindowKeys::default();
++        assert!(!keys.select(1, 1));
++        assert!(!keys.select(0x1d, 0x3a));
++        for code in [0x01, 0x1d, 0x3a, 0x10, 0xe01d, 0x58] {
++            assert_eq!(keys.event(code, true, || panic!("unexpected focus check")), Some(code));
++            assert_eq!(keys.event(code, false, || false), Some(code));
++        }
++        assert!(keys.release_mapped().is_empty());
++    }
++}

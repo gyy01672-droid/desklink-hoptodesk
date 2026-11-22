@@ -1,7 +1,7 @@
-name: Windows performance client
+name: Windows 4.1.1 native client
 on:
   push:
-    branches: [windows-performance-1.46.88]
+    branches: [windows-native-4.1.1]
     paths:
       - 'windows-native/**'
       - '.github/workflows/windows-native.yml'
@@ -9,7 +9,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: hoptodesk-windows-native
+  group: hoptodesk-windows-4-1-1
   cancel-in-progress: false
 jobs:
   windows:
@@ -38,7 +38,7 @@ jobs:
           if ((git -C upstream/hoptodesk rev-parse HEAD) -ne 'cc56380b38c962770ed9e0d704235c94f1881248') {throw 'Unexpected source revision'}
           $date = git show -s --date=format:'%Y-%m-%d %H:%M' --format=%cd HEAD
           "HOPTODESK_BUILD_DATE=$date" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          foreach ($file in 'windows-native/build-compat.patch','windows-native/performance.patch','windows-native/session-traffic.patch','windows-native/quality-diagnostics.patch','windows-native/network-shortcut.patch','windows-native/responsive-codec.patch','windows-native/direct-retry.patch') {
+          foreach ($file in 'windows-native/build-compat.patch','windows-native/performance.patch','windows-native/session-traffic.patch','windows-native/quality-diagnostics.patch','windows-native/network-shortcut.patch','windows-native/responsive-codec.patch','windows-native/direct-retry.patch','windows-native/window-keys.patch','windows-native/session-virtual-privacy.patch') {
             python -c "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_bytes(p.read_bytes().replace(b'\r\n',b'\n'))" $file
             git -C upstream/hoptodesk apply (Resolve-Path $file)
             if ($LASTEXITCODE) {throw "Patch did not apply: $file"}
@@ -131,6 +131,10 @@ jobs:
           cargo test --locked --release --lib --features packui,nativecodec direct_probe::tests::retry_
           if ($LASTEXITCODE) {throw 'Direct retry network tests failed'}
           cargo test --locked --release -p scrap --features nativecodec --lib responsive_tests::
+          if ($LASTEXITCODE) {throw 'Responsive codec regressions failed'}
+          cargo test --locked --release --lib --features packui,nativecodec ui_session_interface::window_keys::tests::
+          if ($LASTEXITCODE) {throw 'Window key remapping tests failed'}
+          cargo test --locked --release --lib --features packui,nativecodec client::session_virtual_privacy_tests::
       - name: Stage executable and notices
         shell: pwsh
         run: |

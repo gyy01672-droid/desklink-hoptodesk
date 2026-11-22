@@ -1,0 +1,296 @@
+diff --git a/src/client.rs b/src/client.rs
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -2055,6 +2055,8 @@
+ /// Login config handler for [`Client`].
+ #[derive(Default)]
+ pub struct LoginConfigHandler {
++    // None for ordinary privacy settings. Some(false) awaits the host's reply.
++    pub(crate) session_virtual_privacy: Option<bool>,
+     id: String,
+     pub conn_type: ConnType,
+     pub is_terminal_admin: bool,
+@@ -2106,7 +2108,37 @@
+     PeerConfig::load(id)
+ }
+ 
++#[cfg(test)]
++mod session_virtual_privacy_tests {
++    use super::LoginConfigHandler;
++
++    #[test]
++    fn explicit_activation_does_not_set_the_reconnect_option() {
++        let mut lc = LoginConfigHandler::default();
++        lc.config.privacy_mode.v = false;
++        assert!(!lc.acknowledge_session_virtual_privacy(true));
++        lc.session_virtual_privacy = Some(false);
++        assert!(lc.acknowledge_session_virtual_privacy(true));
++        assert!(lc.get_toggle_option("privacy-mode"));
++        assert!(!lc.config.privacy_mode.v);
++        assert!(lc.acknowledge_session_virtual_privacy(false));
++        assert!(!lc.get_toggle_option("privacy-mode"));
++        assert_eq!(lc.session_virtual_privacy, None);
++        lc.config.privacy_mode.v = true;
++        assert!(!lc.acknowledge_session_virtual_privacy(false));
++        assert!(lc.get_toggle_option("privacy-mode"));
++    }
++}
++
+ impl LoginConfigHandler {
++    fn acknowledge_session_virtual_privacy(&mut self, on: bool) -> bool {
++        if self.session_virtual_privacy.is_none() {
++            return false;
++        }
++        self.session_virtual_privacy = if on { Some(true) } else { None };
++        true
++    }
++
+     /// Initialize the login config handler.
+     ///
+     /// # Arguments
+@@ -2403,7 +2435,7 @@
+             .into();
+         } else if name == "privacy-mode" {
+             // try toggle privacy mode
+-            option.privacy_mode = (if config.privacy_mode.v {
++            option.privacy_mode = (if self.session_virtual_privacy.unwrap_or(config.privacy_mode.v) {
+                 BoolOption::No
+             } else {
+                 BoolOption::Yes
+@@ -2612,7 +2644,7 @@
+         } else if name == "lock-after-session-end" {
+             self.config.lock_after_session_end.v
+         } else if name == "privacy-mode" {
+-            self.config.privacy_mode.v
++            self.session_virtual_privacy.unwrap_or(self.config.privacy_mode.v)
+         } else if name == config::keys::OPTION_ENABLE_FILE_COPY_PASTE {
+             self.config.enable_file_copy_paste.v
+         } else if name == "disable-audio" {
+diff --git a/src/privacy_mode.rs b/src/privacy_mode.rs
+--- a/src/privacy_mode.rs
++++ b/src/privacy_mode.rs
+@@ -231,22 +231,27 @@
+     }
+ }
+ 
+-fn get_supported_impl(impl_key: &str) -> String {
++fn get_supported_impl(impl_key: &str) -> Option<String> {
+     let supported_impls = get_supported_privacy_mode_impl();
+     if supported_impls.iter().any(|(k, _)| k == &impl_key) {
+-        return impl_key.to_owned();
++        return Some(impl_key.to_owned());
+     };
++    // An explicit virtual display request may arrive after service or display
++    // conditions changed. Do not substitute a different privacy mechanism.
++    if impl_key == PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY {
++        return None;
++    }
+     // TODO: Is it a good idea to use fallback here? Because user do not know the fallback.
+     // fallback
+     let mut cur_impl = get_option("privacy-mode-impl-key".to_owned());
+-    if !get_supported_privacy_mode_impl()
++    if !supported_impls
+         .iter()
+         .any(|(k, _)| k == &cur_impl)
+     {
+         // fallback
+         cur_impl = DEFAULT_PRIVACY_MODE_IMPL.to_owned();
+     }
+-    cur_impl
++    Some(cur_impl)
+ }
+ 
+ pub async fn turn_on_privacy(impl_key: &str, conn_id: i32) -> Option<ResultType<bool>> {
+@@ -289,7 +294,10 @@
+     let mut privacy_mode_lock = PRIVACY_MODE.lock().unwrap();
+ 
+     // Check or switch privacy mode implementation
+-    let impl_key = get_supported_impl(impl_key);
++    let impl_key = match get_supported_impl(impl_key) {
++        Some(key) => key,
++        None => return Some(Err(anyhow!("Unsupported privacy mode: {}", impl_key))),
++    };
+ 
+     let mut cur_impl_key = "".to_string();
+     if let Some(privacy_mode) = privacy_mode_lock.as_ref() {
+@@ -387,7 +395,9 @@
+             }
+         }
+ 
+-        if is_installed() && crate::platform::windows::is_self_service_running() {
++        if is_installed() && crate::platform::windows::is_self_service_running()
++            && crate::virtual_display_manager::is_virtual_display_supported()
++        {
+             vec_impls.push((
+                 PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY,
+                 "privacy_mode_impl_virtual_display_tip",
+diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
+--- a/src/client/io_loop.rs
++++ b/src/client/io_loop.rs
+@@ -176,6 +176,7 @@
+     }
+ 
+     pub async fn io_loop(&mut self, _key: &str, _token: &str, round: u32) {
++        self.handler.lc.write().unwrap().session_virtual_privacy = None;
+         RUNNING_SESSION_LOOPS.fetch_add(1, Ordering::SeqCst);
+         let _running = crate::SimpleCallOnReturn {
+             b: true,
+@@ -1265,7 +1266,7 @@
+     async fn send_toggle_privacy_mode_msg(&self, peer: &mut Stream) {
+         let lc = self.handler.lc.read().unwrap();
+         if lc.version >= hbb_common::get_version_number("1.2.4")
+-            && lc.get_toggle_option("privacy-mode")
++            && lc.config.privacy_mode.v
+         {
+             let impl_key = lc.get_option("privacy-mode-impl-key");
+             if impl_key == crate::privacy_mode::PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY
+@@ -2388,6 +2389,11 @@
+ 
+     #[inline(always)]
+     fn update_privacy_mode(&mut self, impl_key: String, on: bool) {
++        let session_only = self.handler.lc.write().unwrap().acknowledge_session_virtual_privacy(on);
++        if session_only {
++            self.handler.update_privacy_mode();
++            return;
++        }
+         let mut config = self.handler.load_config();
+         config.privacy_mode.v = on;
+         if on {
+diff --git a/src/lang/cn.rs b/src/lang/cn.rs
+--- a/src/lang/cn.rs
++++ b/src/lang/cn.rs
+@@ -126,6 +126,10 @@
+         ("Finished", "完成"),
+         ("Speed", "速度"),
+         ("Session received", "本次接收流量"),
++        ("Virtual display privacy for this session", "本次连接使用虚拟屏隐私模式"),
++        ("End virtual display privacy", "结束虚拟屏隐私模式"),
++        ("On first use, the host may install its signed virtual display driver and trust its publisher. The driver stays installed after disconnecting.", "首次使用时，被控电脑可能会安装已签名的虚拟显示驱动，并将其发布者加入本机信任列表。断开连接后驱动仍会保留。"),
++        ("Use a virtual display and turn off physical displays for this connection? Press Ctrl+P on the host or disconnect to restore them.", "本次连接将切换到虚拟屏，关闭被控电脑的物理显示输出。可以在被控电脑按 Ctrl+P 或断开连接恢复显示。现在启用吗？"),
+         ("Custom Image Quality", "设置画面质量"),
+         ("Frame rate", "帧率"),
+         ("Type clipboard", "键入剪贴板内容"),
+diff --git a/src/privacy_mode/win_virtual_display.rs b/src/privacy_mode/win_virtual_display.rs
+--- a/src/privacy_mode/win_virtual_display.rs
++++ b/src/privacy_mode/win_virtual_display.rs
+@@ -499,7 +499,8 @@
+         state: Option<PrivacyModeState>,
+     ) -> ResultType<()> {
+         self.check_off_conn_id(conn_id)?;
+-        super::win_input::unhook()?;
++        // Restore the physical displays even if the input hook thread has ended.
++        let input_result = super::win_input::unhook();
+         let _tmp_ignore_changed_holder = crate::display_service::temp_ignore_displays_changed();
+         self.restore();
+         // We need to force restore the registry connectivity.
+@@ -518,7 +519,7 @@
+             self.conn_id = INVALID_PRIVACY_MODE_CONN_ID.to_owned();
+         }
+ 
+-        Ok(())
++        input_result
+     }
+ 
+     #[inline]
+diff --git a/src/ui/header.tis b/src/ui/header.tis
+--- a/src/ui/header.tis
++++ b/src/ui/header.tis
+@@ -326,6 +326,7 @@
+                 {!cursor_embedded && <li #show-remote-cursor .toggle-option title={translate("Show remote cursor")}><span .toggle-track><span .toggle-knob /></span>{translate('Show remote cursor')}</li>}
+                 <li #show-quality-monitor .toggle-option title={translate("Show quality monitor")}><span .toggle-track><span .toggle-knob /></span>{translate('Show quality monitor')}</li>
+                 <li #copy-performance-report>{translate("Copy performance diagnostics")}</li>
++                {canUseSessionVirtualPrivacy() ? <li #session-virtual-privacy>{handler.session_virtual_privacy_on() ? translate("End virtual display privacy") : translate("Virtual display privacy for this session")}</li> : ""}
+                 {handler.version_cmp(pi.version, '1.46.6') >= 0 && (pi.platform == "Windows" || pi.platform == "Mac OS" || pi.platform == "Linux") ? <li #show-my-cursor .toggle-option title={translate("Show my cursor")}><span .toggle-track><span .toggle-knob /></span>{translate('Show my cursor')}</li> : ""}
+                 {audio_enabled ? <li #disable-audio .toggle-option title={translate("Mute")}><span .toggle-track><span .toggle-knob /></span>{translate('Mute')}</li> : ""}
+                 {(is_win && pi.platform == "Windows") && file_enabled ? <li #enable-file-copy-paste .toggle-option title={translate("Enable file copy and paste")}><span .toggle-track><span .toggle-knob /></span>{translate('Enable file copy and paste')}</li> : ""}
+@@ -641,6 +642,8 @@
+             toggleQualityMonitor(me.id);
+         } else if (me.id == "copy-performance-report") {
+             copyPerformanceReport();
++        } else if (me.id == "session-virtual-privacy") {
++            changeSessionVirtualPrivacy();
+         } else if (me.id == "i444") {
+             toggleI444(me.id);
+         } else if (me.attributes.hasClass("toggle-option")) {
+@@ -1326,6 +1329,28 @@
+     }
+ }
+ 
++function canUseSessionVirtualPrivacy() {
++    if (handler.session_virtual_privacy_on()) return true;
++    return pi && pi.platform == "Windows" && pi.virtual_privacy && !is_view_camera &&
++        keyboard_enabled && !handler.get_toggle_option("view-only") &&
++        handler.is_privacy_mode_supported() && !handler.get_toggle_option("privacy-mode");
++}
++
++function changeSessionVirtualPrivacy() {
++    if (handler.session_virtual_privacy_on()) {
++        handler.set_session_virtual_privacy(false);
++        return;
++    }
++    if (!canUseSessionVirtualPrivacy()) return;
++    msgbox("confirm", translate("Virtual display privacy for this session"),
++        translate("Use a virtual display and turn off physical displays for this connection? Press Ctrl+P on the host or disconnect to restore them.") + "\n\n" +
++        translate("On first use, the host may install its signed virtual display driver and trust its publisher. The driver stays installed after disconnecting."), "",
++        function(res=null) {
++            if (res != null && canUseSessionVirtualPrivacy()) handler.set_session_virtual_privacy(true);
++        }
++    );
++}
++
+ function canBlockInput() {
+     return pi.sas_enabled || pi.block_input;
+ }
+diff --git a/src/ui/remote.rs b/src/ui/remote.rs
+--- a/src/ui/remote.rs
++++ b/src/ui/remote.rs
+@@ -544,6 +544,13 @@
+         pi_value.set_item("version", pi.version.clone());
+         pi_value.set_item("dashboard_linked", pi.dashboard_linked);
+         if let Ok(additions) = serde_json::from_str::<serde_json::Value>(&pi.platform_additions) {
++            let virtual_privacy = additions["supported_privacy_mode_impl"]
++                .as_array()
++                .map_or(false, |modes| modes.iter().any(|m| {
++                    m.get(0).and_then(|key| key.as_str())
++                        == Some(crate::privacy_mode::PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY)
++                }));
++            pi_value.set_item("virtual_privacy", virtual_privacy);
+             if let Some(name) = additions["dashboard_device_name"].as_str() {
+                 pi_value.set_item("dashboard_device_name", name.to_string());
+             }
+@@ -740,6 +747,26 @@
+ }
+ 
+ impl RemoteSession {
++    fn set_session_virtual_privacy(&self, on: bool) {
++        let mut lc = self.lc.write().unwrap();
++        if on {
++            if lc.get_toggle_option("privacy-mode") {
++                return;
++            }
++            lc.session_virtual_privacy = Some(false);
++        } else if lc.session_virtual_privacy != Some(true) {
++            return;
++        }
++        drop(lc);
++        self.toggle_privacy_mode(
++            crate::privacy_mode::PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY.to_owned(), on,
++        );
++    }
++
++    fn session_virtual_privacy_on(&self) -> bool {
++        self.lc.read().unwrap().session_virtual_privacy == Some(true)
++    }
++
+     fn send_terminal_resize(&self, terminal_id: i32, rows: i32, cols: i32) {
+         self.session.ui_handler.ensure_terminal(
+             terminal_id,
+@@ -956,6 +983,8 @@
+         fn handle_screenshot(String);
+         fn get_toggle_option(String);
+         fn is_privacy_mode_supported();
++        fn set_session_virtual_privacy(bool);
++        fn session_virtual_privacy_on();
+         fn is_remote_printing_supported();
+         fn is_voice_call_supported();
+         fn kvm_available();
