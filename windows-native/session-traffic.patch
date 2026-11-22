@@ -1,0 +1,259 @@
+diff --git a/flutter/lib/common/widgets/overlay.dart b/flutter/lib/common/widgets/overlay.dart
+index 17c73fe..0422b87 100644
+--- a/flutter/lib/common/widgets/overlay.dart
++++ b/flutter/lib/common/widgets/overlay.dart
+@@ -585,6 +585,7 @@ class QualityMonitor extends StatelessWidget {
+                     crossAxisAlignment: CrossAxisAlignment.start,
+                     children: [
+                       _row("Speed", qualityMonitorModel.data.speed ?? '-'),
++                      _row(translate("Session received"), qualityMonitorModel.data.sessionReceived ?? '-'),
+                       _row("FPS", qualityMonitorModel.data.fps ?? '-'),
+                       // let delay be 0 if fps is 0
+                       _row(
+diff --git a/flutter/lib/models/model.dart b/flutter/lib/models/model.dart
+index ecf7259..bbdaf96 100644
+--- a/flutter/lib/models/model.dart
++++ b/flutter/lib/models/model.dart
+@@ -2644,6 +2644,7 @@ class CursorModel with ChangeNotifier {
+ 
+ class QualityMonitorData {
+   String? speed;
++  String? sessionReceived;
+   String? fps;
+   String? delay;
+   String? targetBitrate;
+@@ -2675,6 +2676,10 @@ class QualityMonitorModel with ChangeNotifier {
+       if (evt.containsKey('speed') && (evt['speed'] as String).isNotEmpty) {
+         _data.speed = evt['speed'];
+       }
++      final received = evt['session_received'];
++      if (received is String && received.isNotEmpty) {
++        _data.sessionReceived = received;
++      }
+       if (evt.containsKey('fps') && (evt['fps'] as String).isNotEmpty) {
+         final fps = jsonDecode(evt['fps']) as Map<String, dynamic>;
+         final pi = parent.target?.ffiModel.pi;
+diff --git a/src/client.rs b/src/client.rs
+index 83a622a..76bc678 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -102,6 +102,7 @@ pub use super::lang::*;
+ pub mod file_trait;
+ pub mod helper;
+ pub mod io_loop;
++mod traffic;
+ pub mod screenshot;
+ 
+ pub const MILLI1: Duration = Duration::from_millis(1);
+diff --git a/src/client/helper.rs b/src/client/helper.rs
+index 98d1239..1e93980 100644
+--- a/src/client/helper.rs
++++ b/src/client/helper.rs
+@@ -8,6 +8,7 @@ use std::collections::HashMap;
+ #[derive(Debug, Default)]
+ pub struct QualityStatus {
+     pub speed: Option<String>,
++    pub session_received: Option<String>,
+     pub fps: HashMap<usize, i32>,
+     pub delay: Option<i32>,
+     pub target_bitrate: Option<i32>,
+diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
+index ef5f219..970e3dd 100644
+--- a/src/client/io_loop.rs
++++ b/src/client/io_loop.rs
+@@ -101,7 +101,6 @@ pub struct Remote<T: InvokeUiSession> {
+     first_frame: bool,
+     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+     client_conn_id: i32, // used for file clipboard
+-    data_count: Arc<AtomicUsize>,
+     video_format: CodecFormat,
+     elevation_requested: bool,
+     peer_info: ParsedPeerInfo,
+@@ -156,7 +155,6 @@ impl<T: InvokeUiSession> Remote<T> {
+             first_frame: false,
+             #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+             client_conn_id: 0,
+-            data_count: Arc::new(AtomicUsize::new(0)),
+             video_format: CodecFormat::Unknown,
+             stop_voice_call_sender: None,
+             voice_call_request_timestamp: None,
+@@ -274,6 +272,7 @@ impl<T: InvokeUiSession> Remote<T> {
+                 let mut status_timer =
+                     crate::rustdesk_interval(time::interval(Duration::new(1, 0)));
+                 let mut fps_instant = Instant::now();
++                let mut traffic = super::traffic::ReceivedTraffic::default();
+ 
+                 loop {
+                     #[cfg(feature = "fips")]
+@@ -317,7 +316,7 @@ impl<T: InvokeUiSession> Remote<T> {
+                                             received = true;
+                                             self.handler.update_received(true);
+                                         }
+-                                        self.data_count.fetch_add(bytes.len(), Ordering::Relaxed);
++                                        traffic.add(bytes.len());
+                                         if !self.handle_msg_from_peer(bytes, &mut peer).await {
+                                             break
+                                         }
+@@ -382,13 +381,13 @@ impl<T: InvokeUiSession> Remote<T> {
+                                 continue;
+                             }
+                             fps_instant = Instant::now();
+-                            let speed = self.data_count.swap(0, Ordering::Relaxed);
++                            let speed = traffic.sample_bytes();
+                             
+                             // Prevent integer overflow in speed calculation
+                             // Use saturating operations and u64 for intermediate calculations
+                             let speed_bps = if elapsed > 0 {
+                                 // Convert to u64 to prevent overflow, then back to safe range
+-                                let speed_u64 = (speed as u64).saturating_mul(1000) / (elapsed as u64);
++                                let speed_u64 = speed.saturating_mul(1000) / (elapsed as u64);
+                                 // Cap at reasonable maximum to prevent display issues
+                                 std::cmp::min(speed_u64, u32::MAX as u64) as usize
+                             } else {
+@@ -428,6 +427,7 @@ impl<T: InvokeUiSession> Remote<T> {
+                             };
+                             self.handler.update_quality_status(QualityStatus {
+                                 speed: Some(speed_display),
++                                session_received: Some(traffic.display_total()),
+                                 fps,
+                                 chroma,
+                                 codec_format,
+diff --git a/src/flutter.rs b/src/flutter.rs
+index 3da55e0..d4a435c 100644
+--- a/src/flutter.rs
++++ b/src/flutter.rs
+@@ -662,6 +662,7 @@ impl InvokeUiSession for FlutterHandler {
+             "update_quality_status",
+             &[
+                 ("speed", &status.speed.map_or(NULL, |it| it)),
++                ("session_received", &status.session_received.map_or(NULL, |it| it)),
+                 (
+                     "fps",
+                     &serde_json::ser::to_string(&status.fps).unwrap_or(NULL.to_owned()),
+@@ -2228,4 +2229,4 @@ pub(super) mod async_tasks {
+             
+     }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/src/lang/cn.rs b/src/lang/cn.rs
+index fdc8d75..e65e1fb 100644
+--- a/src/lang/cn.rs
++++ b/src/lang/cn.rs
+@@ -125,6 +125,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("Waiting", "等待..."),
+         ("Finished", "完成"),
+         ("Speed", "速度"),
++        ("Session received", "本次接收流量"),
+         ("Custom Image Quality", "设置画面质量"),
+         ("Frame rate", "帧率"),
+         ("Type clipboard", "键入剪贴板内容"),
+diff --git a/src/ui/remote.rs b/src/ui/remote.rs
+index c7e8e3f..fa264e5 100644
+--- a/src/ui/remote.rs
++++ b/src/ui/remote.rs
+@@ -371,7 +371,8 @@ impl InvokeUiSession for RemoteUiHandler {
+                 status.target_bitrate.map_or(Value::null(), |it| it.into()),
+                 status
+                     .codec_format
+-                    .map_or(Value::null(), |it| it.to_string().into())
++                    .map_or(Value::null(), |it| it.to_string().into()),
++                status.session_received.map_or(Value::null(), |it| it.into())
+             ),
+         );
+     }
+diff --git a/src/ui/remote.tis b/src/ui/remote.tis
+index 07ed608..e6850cb 100644
+--- a/src/ui/remote.tis
++++ b/src/ui/remote.tis
+@@ -1327,6 +1327,9 @@ class QualityMonitor: Reactor.Component
+             <div>
+                 Speed: {qualityMonitorData[0]}
+             </div>
++            <div>
++                {translate("Session received")}: {qualityMonitorData[5] || "-"}
++            </div>
+             <div>
+                 FPS: {qualityMonitorData[1]}
+             </div>
+@@ -1413,13 +1416,14 @@ class DrawPalette: Reactor.Component
+ }
+ 
+ $(#draw-palette).content(<DrawPalette />);
+-handler.updateQualityStatus = function(speed, fps, delay, bitrate, codec_format) {
++handler.updateQualityStatus = function(speed, fps, delay, bitrate, codec_format, session_received) {
+     if (is_file_transfer || is_port_forward || is_terminal) return;
+     speed ? qualityMonitorData[0] = speed:null;
+     fps ? qualityMonitorData[1] = fps:null;
+     delay ? qualityMonitorData[2] = delay:null;
+     bitrate ? qualityMonitorData[3] = bitrate:null;
+     codec_format ? qualityMonitorData[4] = codec_format:null;
++    if (session_received) qualityMonitorData[5] = session_received;
+     qualityMonitor.update();
+     // Update codec menu selection without full header re-render (avoids menu flicker)
+     if (codec_format) self.timer(1ms, toggleMenuState);
+diff --git a/src/client/traffic.rs b/src/client/traffic.rs
+new file mode 100644
+index 0000000..3546dd7
+--- /dev/null
++++ b/src/client/traffic.rs
+@@ -0,0 +1,58 @@
++/// Payload returned by Stream::next for one viewer connection, in either route.
++#[derive(Default)]
++pub(super) struct ReceivedTraffic {
++    total: u64,
++    last_sample: u64,
++}
++
++impl ReceivedTraffic {
++    pub(super) fn add(&mut self, bytes: usize) {
++        self.total = self.total.saturating_add(bytes as u64);
++    }
++
++    pub(super) fn sample_bytes(&mut self) -> u64 {
++        let bytes = self.total - self.last_sample;
++        self.last_sample = self.total;
++        bytes
++    }
++
++    pub(super) fn display_total(&self) -> String {
++        let bytes = self.total;
++        for (unit, name) in [(1u64 << 30, "GiB"), (1u64 << 20, "MiB"), (1u64 << 10, "KiB")] {
++            if bytes >= unit {
++                return format!("{:.2} {}", bytes as f64 / unit as f64, name);
++            }
++        }
++        format!("{} B", bytes)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn rate_samples_do_not_reset_the_session_total() {
++        let mut rx = ReceivedTraffic::default();
++        assert_eq!(rx.display_total(), "0 B");
++        rx.add(1023);
++        assert_eq!(rx.sample_bytes(), 1023);
++        rx.add(1);
++        assert_eq!(rx.sample_bytes(), 1);
++        assert_eq!(rx.sample_bytes(), 0);
++        assert_eq!(rx.display_total(), "1.00 KiB");
++        rx.add((5 << 20) - 1024);
++        assert_eq!(rx.display_total(), "5.00 MiB");
++    }
++
++    #[test]
++    fn long_sessions_and_separate_connections() {
++        let mut active = ReceivedTraffic::default();
++        for _ in 0..5 {
++            active.add(1 << 30);
++            assert_eq!(active.sample_bytes(), 1 << 30);
++        }
++        assert_eq!(active.display_total(), "5.00 GiB");
++        assert_eq!(ReceivedTraffic::default().display_total(), "0 B");
++    }
++}

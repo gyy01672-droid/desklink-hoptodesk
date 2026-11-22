@@ -10,7 +10,7 @@ permissions:
   contents: read
 concurrency:
   group: hoptodesk-windows-native
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   windows:
     runs-on: windows-2022
@@ -35,13 +35,14 @@ jobs:
           git submodule update --init --depth 1 upstream/hoptodesk
           if ($LASTEXITCODE) {throw 'Source checkout failed'}
           if ((git -C upstream/hoptodesk rev-parse HEAD) -ne 'cc56380b38c962770ed9e0d704235c94f1881248') {throw 'Unexpected source revision'}
-          if (Test-Path windows-native/performance.patch) {
-            git -C upstream/hoptodesk apply (Resolve-Path windows-native/performance.patch)
-            if ($LASTEXITCODE) {throw 'Performance patch did not apply'}
+          foreach ($file in 'windows-native/performance.patch','windows-native/session-traffic.patch') {
+            git -C upstream/hoptodesk apply (Resolve-Path $file)
+            if ($LASTEXITCODE) {throw "Patch did not apply: $file"}
           }
           rustc -V
       - name: Restore vcpkg packages
-        uses: actions/cache@v4
+        id: codec-cache
+        uses: actions/cache/restore@v4
         with:
           path: D:\a\vcpkg-bincache
           key: win-x64-static-9e593b-vpx-yuv-opus-v1
@@ -80,6 +81,20 @@ jobs:
           if ($LASTEXITCODE) {throw 'vcpkg bootstrap failed'}
           & "$env:VCPKG_ROOT/vcpkg.exe" install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static --clean-after-build
           if ($LASTEXITCODE) {throw 'Static codec build failed'}
+      - name: Save compiled codec dependencies
+        uses: actions/cache/save@v4
+        if: steps.codec-cache.outputs.cache-hit != 'true'
+        with:
+          path: D:\a\vcpkg-bincache
+          key: win-x64-static-9e593b-vpx-yuv-opus-v1
+      - name: Restore Rust dependency downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: windows-rust-hoptodesk-cc56380b-v1
       - name: Rebuild the Windows program
         working-directory: upstream/hoptodesk
         shell: pwsh
@@ -96,6 +111,8 @@ jobs:
         shell: pwsh
         run: |
           cargo test --locked --release --lib --features packui,nativecodec server::video_qos::tests::
+          if ($LASTEXITCODE) {throw 'QoS regressions failed'}
+          cargo test --locked --release --lib --features packui,nativecodec client::traffic::tests::
       - uses: actions/upload-artifact@v4
         if: ${{ hashFiles('windows-native/performance.patch') != '' }}
         with:
