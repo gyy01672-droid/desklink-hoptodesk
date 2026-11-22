@@ -6,6 +6,21 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows' -or $env:RUN
     throw 'This UI smoke test runs in a disposable GitHub-hosted Windows job.'
 }
 $source = (Resolve-Path -LiteralPath $Executable).Path
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+$dumpbin = & $vswhere -latest -products '*' -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+if (-not $dumpbin) { throw 'The hosted toolchain is missing dumpbin.' }
+$output = & $dumpbin /NOLOGO /DEPENDENTS $source
+if ($LASTEXITCODE -ne 0) { throw 'Could not inspect PE dependencies.' }
+$modules = @($output | ForEach-Object { if ($_ -match '^\s*([\w.-]+\.(dll|drv))\s*$') { $Matches[1] } })
+if ($modules -notcontains 'kernel32.dll') { throw 'Missing import table in dumpbin output.' }
+foreach ($module in $modules) {
+    if ($module -match '^(api|ext)-ms-win-') { continue }
+    $installed = Join-Path ([Environment]::SystemDirectory) $module
+    if ($module -match '^(vcruntime\d|msvcp\d|concrt\d|vcomp\d|msvcr\d|sciter|webview2loader)' -or -not (Test-Path -LiteralPath $installed)) {
+        throw "The native EXE needs an additional runtime: $module"
+    }
+}
+Write-Output ('PE dependencies: ' + ($modules -join ', '))
 $codeTree = (Get-Item -LiteralPath $source).Directory.Parent.Parent.FullName
 # WireUI's WUIAR1 pack embeds uncompressed page files. Check the actual
 # homepage and its scripts from this checkout before testing the window.

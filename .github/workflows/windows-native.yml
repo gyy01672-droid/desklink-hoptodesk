@@ -21,6 +21,7 @@ jobs:
       VCPKG_DISABLE_METRICS: 1
       CARGO_TERM_COLOR: never
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
       CARGO_PROFILE_RELEASE_LTO: 'false'
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '8'
       CARGO_PROFILE_RELEASE_OPT_LEVEL: '3'
@@ -35,7 +36,9 @@ jobs:
           git submodule update --init --depth 1 upstream/hoptodesk
           if ($LASTEXITCODE) {throw 'Source checkout failed'}
           if ((git -C upstream/hoptodesk rev-parse HEAD) -ne 'cc56380b38c962770ed9e0d704235c94f1881248') {throw 'Unexpected source revision'}
-          foreach ($file in 'windows-native/performance.patch','windows-native/session-traffic.patch','windows-native/quality-diagnostics.patch') {
+          $date = git show -s --date=format:'%Y-%m-%d %H:%M' --format=%cd HEAD
+          "HOPTODESK_BUILD_DATE=$date" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          foreach ($file in 'windows-native/build-compat.patch','windows-native/performance.patch','windows-native/session-traffic.patch','windows-native/quality-diagnostics.patch') {
             git -C upstream/hoptodesk apply (Resolve-Path $file)
             if ($LASTEXITCODE) {throw "Patch did not apply: $file"}
           }
