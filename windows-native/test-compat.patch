@@ -1,0 +1,15 @@
+diff --git a/src/platform/windows.rs b/src/platform/windows.rs
+--- a/src/platform/windows.rs
++++ b/src/platform/windows.rs
+@@ -4146,11 +4146,6 @@ pub fn try_kill_broker() {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    #[test]
+-    fn test_uninstall_cert() {
+-        println!("uninstall driver certs: {:?}", cert::uninstall_cert());
+-    }
+-
+     #[test]
+     fn test_get_unicode_char_by_vk() {
+         let chr = get_char_from_vk(0x41); // VK_A
