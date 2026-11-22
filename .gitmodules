@@ -1,0 +1,3 @@
+[submodule "upstream/hoptodesk"]
+	path = upstream/hoptodesk
+	url = https://gitlab.com/hoptodesk/hoptodesk.git
