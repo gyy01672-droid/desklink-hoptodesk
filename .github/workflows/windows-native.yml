@@ -122,6 +122,10 @@ jobs:
         working-directory: upstream/hoptodesk
         shell: pwsh
         run: |
+          $testPatch = (Resolve-Path ../../windows-native/test-compat.patch).Path
+          python -c "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_bytes(p.read_bytes().replace(b'\r\n',b'\n'))" $testPatch
+          git apply $testPatch
+          if ($LASTEXITCODE) {throw 'The isolated test compatibility patch did not apply'}
           cargo test --locked --release --lib --features packui,nativecodec server::video_qos::tests::
           if ($LASTEXITCODE) {throw 'QoS regressions failed'}
           cargo test --locked --release --lib --features packui,nativecodec client::traffic::tests::
