@@ -1,0 +1,100 @@
+name: Windows performance client
+on:
+  push:
+    branches: [windows-performance-1.46.88]
+    paths:
+      - 'windows-native/**'
+      - '.github/workflows/windows-native.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: hoptodesk-windows-native
+  cancel-in-progress: true
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    env:
+      VCPKG_ROOT: D:\a\vcpkg-pinned
+      VCPKG_DEFAULT_BINARY_CACHE: D:\a\vcpkg-bincache
+      VCPKG_DISABLE_METRICS: 1
+      CARGO_TERM_COLOR: never
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '8'
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: '3'
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Fetch pinned source
+        shell: pwsh
+        run: |
+          git submodule update --init --depth 1 upstream/hoptodesk
+          if ($LASTEXITCODE) {throw 'Source checkout failed'}
+          if ((git -C upstream/hoptodesk rev-parse HEAD) -ne 'cc56380b38c962770ed9e0d704235c94f1881248') {throw 'Unexpected source revision'}
+          if (Test-Path windows-native/performance.patch) {
+            git -C upstream/hoptodesk apply (Resolve-Path windows-native/performance.patch)
+            if ($LASTEXITCODE) {throw 'Performance patch did not apply'}
+          }
+          rustc -V
+      - name: Restore vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: D:\a\vcpkg-bincache
+          key: win-x64-static-9e593b-vpx-yuv-opus-v1
+      - name: Prepare original signed display assets
+        shell: pwsh
+        run: |
+          $file = Join-Path $env:RUNNER_TEMP HopToDesk64.exe
+          $wanted = '1586f3bc3538a9e7a40c5273bdfe73f50070cffae119ecc725d7e604101fff88'
+          foreach ($url in 'https://dl.hoptodesk.com/HopToDesk64.exe?v=1.46.88','https://dl.hoptodesk.com/HopToDesk64.exe') {
+            curl.exe --fail --location --retry 2 $url -o $file
+            if ($LASTEXITCODE -eq 0 -and (Get-FileHash $file).Hash -eq $wanted) {break}
+          }
+          if ((Get-FileHash $file).Hash -ne $wanted) {throw 'Original release hash mismatch'}
+          if ((Get-AuthenticodeSignature $file).Status -ne 'Valid') {throw 'Invalid original signature'}
+          $zip = Join-Path $env:RUNNER_TEMP upx.zip
+          curl.exe --fail --location --retry 2 https://github.com/upx/upx/releases/download/v5.3.0/upx-5.3.0-win64.zip -o $zip
+          if ((Get-FileHash $zip).Hash -ne 'd127996c76615e431be810e9c8d2910dbe3dd400600c5c0c50276fc5a17a9705') {throw 'UPX hash mismatch'}
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          $unpacked = Join-Path $env:RUNNER_TEMP unpacked.exe
+          & "$env:RUNNER_TEMP/upx-5.3.0-win64/upx.exe" -d -o $unpacked $file
+          python windows-native/driver_assets.py $unpacked upstream/hoptodesk/res/vdd
+          if ($LASTEXITCODE) {throw 'Driver asset verification failed'}
+          foreach ($asset in 'HtdVDD.dll','HtdVDD.cat') {
+            $signature = Get-AuthenticodeSignature "upstream/hoptodesk/res/vdd/$asset"
+            if ($signature.Status -ne 'Valid') {throw "Unsigned driver asset: $asset"}
+          }
+      - name: Build static codecs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          git init $env:VCPKG_ROOT
+          git -C $env:VCPKG_ROOT fetch --depth 1 https://github.com/microsoft/vcpkg 9e593bb18ea69cc5095e012465dcd675a822ed0d
+          if ($LASTEXITCODE) {throw 'vcpkg fetch failed'}
+          git -C $env:VCPKG_ROOT checkout --detach FETCH_HEAD
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE) {throw 'vcpkg bootstrap failed'}
+          & "$env:VCPKG_ROOT/vcpkg.exe" install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static --clean-after-build
+          if ($LASTEXITCODE) {throw 'Static codec build failed'}
+      - name: Rebuild the Windows program
+        working-directory: upstream/hoptodesk
+        shell: pwsh
+        run: cargo build --locked --release --bin hoptodesk --features packui,nativecodec
+      - name: Check version without starting a remote session
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'upstream/hoptodesk/target/release/hoptodesk.exe').Path
+          $result = & $exe --version | Out-String
+          if ($LASTEXITCODE -ne 0 -or $result -notmatch '1\.46\.88') {throw "Version check failed: $result"}
+          (Get-FileHash $exe).Hash
+      - uses: actions/upload-artifact@v4
+        if: ${{ hashFiles('windows-native/performance.patch') != '' }}
+        with:
+          name: hoptodesk-windows-performance
+          path: upstream/hoptodesk/target/release/hoptodesk.exe
+          if-no-files-found: error
+          retention-days: 7
