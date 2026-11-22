@@ -1,0 +1,41 @@
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -761,6 +761,11 @@
+     
+     fn get_socks(&self) -> Value {
+         Value::from_iter(get_socks())
++    }
++
++    fn desklink_open_network_settings(&self) -> bool {
++        !hbb_common::config::is_disable_settings()
++            && std::env::var("DESKLINK_OPEN_NETWORK_SETTINGS").as_deref() == Ok("1")
+     }
+ 
+     fn direct_connections_blocker(&self) -> String {
+@@ -1470,6 +1475,7 @@
+         fn set_socks(String, String, String, String);
+         fn get_socks();
+         fn direct_connections_blocker();
++        fn desklink_open_network_settings();
+         fn is_share_rdp();
+         fn set_share_rdp(bool);
+         fn is_installed_lower_version();
+--- a/src/ui/index.tis
++++ b/src/ui/index.tis
+@@ -1513,6 +1513,16 @@
+     view.focus = $(#remote_id);
+ 	//refreshCurrentUser();
+     updateTheme();
++    if (handler.desklink_open_network_settings()) {
++        self.timer(1ms, function() {
++            if (!settingsPanelOpen) showSettingsPanel();
++            var direct = $(#toggle-allow-direct-connections);
++            if (direct) {
++                direct.scrollToView();
++                direct.state.focus = true;
++            }
++        });
++    }
+     if (is_osx && handler.get_local_option("mac-permissions-shown") != "Y" && macRequiredMissing(macPermissions())) {
+         handler.set_local_option("mac-permissions-shown", "Y");
+         self.timer(500ms, showMacPermissions);

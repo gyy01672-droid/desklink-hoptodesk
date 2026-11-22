@@ -33,12 +33,13 @@ jobs:
       - name: Fetch pinned source
         shell: pwsh
         run: |
-          git submodule update --init --depth 1 upstream/hoptodesk
+          git -c core.autocrlf=input submodule update --init --depth 1 upstream/hoptodesk
           if ($LASTEXITCODE) {throw 'Source checkout failed'}
           if ((git -C upstream/hoptodesk rev-parse HEAD) -ne 'cc56380b38c962770ed9e0d704235c94f1881248') {throw 'Unexpected source revision'}
           $date = git show -s --date=format:'%Y-%m-%d %H:%M' --format=%cd HEAD
           "HOPTODESK_BUILD_DATE=$date" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          foreach ($file in 'windows-native/build-compat.patch','windows-native/performance.patch','windows-native/session-traffic.patch','windows-native/quality-diagnostics.patch') {
+          foreach ($file in 'windows-native/build-compat.patch','windows-native/performance.patch','windows-native/session-traffic.patch','windows-native/quality-diagnostics.patch','windows-native/network-shortcut.patch') {
+            python -c "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_bytes(p.read_bytes().replace(b'\r\n',b'\n'))" $file
             git -C upstream/hoptodesk apply (Resolve-Path $file)
             if ($LASTEXITCODE) {throw "Patch did not apply: $file"}
           }
@@ -90,14 +91,12 @@ jobs:
         with:
           path: D:\a\vcpkg-bincache
           key: win-x64-static-9e593b-vpx-yuv-opus-v1
-      - name: Restore Rust dependency downloads
-        uses: actions/cache@v4
+      - name: Cache Rust compilation dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
-          path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
-          key: windows-rust-hoptodesk-cc56380b-v1
+          workspaces: upstream/hoptodesk -> target
+          shared-key: windows-native-static-1.46.88
+          cache-on-failure: true
       - name: Rebuild the Windows program
         working-directory: upstream/hoptodesk
         shell: pwsh
