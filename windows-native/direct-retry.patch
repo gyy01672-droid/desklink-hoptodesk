@@ -1,0 +1,381 @@
+diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
+index 970e3dd..9fff00a 100644
+--- a/src/client/io_loop.rs
++++ b/src/client/io_loop.rs
+@@ -437,6 +437,7 @@ impl<T: InvokeUiSession> Remote<T> {
+                     }
+                 }
+                 log::debug!("Exit io_loop of id={}", self.handler.get_id());
++                self.direct_probe = None;
+                 if self.moved_to_direct {
+                     crate::direct_probe::moved_session_ended(&self.handler.id);
+                 }
+@@ -1488,11 +1489,13 @@ impl<T: InvokeUiSession> Remote<T> {
+                         }
+                         self.handler.handle_peer_info(pi);
+                         let relayed = self.handler.lc.read().unwrap().direct == Some(false);
+-                        if host_allows_direct && relayed && peer.is_secured() && self.direct_probe.is_none() {
++                        if host_allows_direct && relayed && peer.is_secured() && self.handler.is_default()
++                            && !self.handler.is_force_relay() && self.direct_probe.is_none() {
+                             self.direct_probe = Some(crate::direct_probe::start_viewer(
+                                 self.handler.id.clone(),
+                                 self.sender.clone(),
+                                 self.lowest_relay_delay,
++                                true,
+                             ));
+                         }
+                         #[cfg(all(target_os = "windows", not(feature = "flutter")))]
+@@ -2156,12 +2159,18 @@ impl<T: InvokeUiSession> Remote<T> {
+                     _ => {}
+                 },
+                 Some(message::Union::TestDelay(t)) => {
+-                    if !t.from_client && t.last_delay > 0 && !self.moved_to_direct {
+-                        if self.lowest_relay_delay == 0 || t.last_delay < self.lowest_relay_delay {
++                    if !t.from_client && !self.moved_to_direct {
++                        if t.last_delay > 0 && (self.lowest_relay_delay == 0 || t.last_delay < self.lowest_relay_delay) {
+                             self.lowest_relay_delay = t.last_delay;
+                         }
+-                        if let Some(probe) = self.direct_probe.as_ref() {
+-                            probe.on_relay_delay(t.last_delay);
++                        let retry = self.direct_probe.as_mut().is_some_and(|probe| probe.on_relay_delay(t.last_delay));
++                        if retry && peer.is_secured() && self.handler.is_default() && !self.handler.is_force_relay()
++                            && self.handler.lc.read().unwrap().direct == Some(false) && self.direct_reads.is_none()
++                            && !self.sender.is_closed() {
++                            log::info!("[direct] retrying a missed path once on the slow relay");
++                            self.direct_probe = Some(crate::direct_probe::start_viewer(
++                                self.handler.id.clone(), self.sender.clone(), t.last_delay, false,
++                            ));
+                         }
+                     }
+                     self.handler.handle_test_delay(t, peer).await;
+diff --git a/src/direct_probe.rs b/src/direct_probe.rs
+index aa819e7..2de5a0a 100644
+--- a/src/direct_probe.rs
++++ b/src/direct_probe.rs
+@@ -28,9 +28,13 @@ use std::{
+     time::Duration,
+ };
+ 
++mod retry;
++use retry::{RetryPermit, SlowRelay};
++
+ pub const OPTION: &str = "allow-direct-connections";
+ 
+-const VERSION: u32 = 2;
++pub const RETRY_VERSION: u32 = retry::PROTOCOL_VERSION;
++const VERSION: u32 = RETRY_VERSION;
+ const STEP_READY_V4: u32 = 1;
+ const STEP_READY_V6: u32 = 2;
+ const STEP_LISTENING: u32 = 3;
+@@ -243,14 +247,26 @@ async fn gate(outside: UdpSocket, peer: SocketAddr, rtt: Duration, conv: u32) ->
+ pub struct Link {
+     steps: mpsc::UnboundedSender<u32>,
+     streams: mpsc::Receiver<Moved>,
++    retry: RetryPermit,
++    worker: tokio::task::JoinHandle<()>,
+ }
+ 
+ impl Link {
++    pub fn can_retry(&self) -> bool {
++        self.retry.ready(std::time::Instant::now()) && self.worker.is_finished()
++    }
++
+     pub fn on_step(&self, step: u32) {
+         self.steps.send(step).ok();
+     }
+ }
+ 
++impl Drop for Link {
++    fn drop(&mut self) {
++        self.worker.abort();
++    }
++}
++
+ pub async fn next_stream(link: &mut Option<Link>) -> Moved {
+     match link {
+         Some(link) => match link.streams.recv().await {
+@@ -438,6 +454,7 @@ pub struct Viewer {
+     answers: mpsc::UnboundedSender<DirectAnswer>,
+     relay_delay: std::sync::Arc<AtomicU32>,
+     pub link: Option<Link>,
++    slow_relay: SlowRelay,
+ }
+ 
+ pub async fn next_viewer_stream(viewer: &mut Option<Viewer>) -> Moved {
+@@ -448,12 +465,14 @@ pub async fn next_viewer_stream(viewer: &mut Option<Viewer>) -> Moved {
+ }
+ 
+ impl Viewer {
+-    pub fn on_relay_delay(&self, ms: u32) {
++    pub fn on_relay_delay(&mut self, ms: u32) -> bool {
+         if ms > 0 {
+             self.relay_delay
+                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seen| (seen == 0 || ms < seen).then_some(ms))
+                 .ok();
+         }
++        self.slow_relay.observe(ms, std::time::Instant::now()) &&
++            self.link.as_ref().is_some_and(Link::can_retry)
+     }
+ 
+     pub fn on_answer(&self, answer: DirectAnswer) {
+@@ -560,16 +579,26 @@ async fn viewer_allowed(peer_id: &str) -> bool {
+     allowed(has_proxy, &options) && !always_relay && !recently_moved_and_ended(peer_id)
+ }
+ 
+-pub fn start_viewer(peer_id: String, to_peer: mpsc::UnboundedSender<crate::client::Data>, relay_delay_seen: u32) -> Viewer {
++pub fn start_viewer(
++    peer_id: String,
++    to_peer: mpsc::UnboundedSender<crate::client::Data>,
++    relay_delay_seen: u32,
++    first_attempt: bool,
++) -> Viewer {
+     let (answers, answers_rx) = mpsc::unbounded_channel();
+     let (steps, steps_rx) = mpsc::unbounded_channel();
+     let (streams_tx, streams) = mpsc::channel(1);
+     let relay_delay = std::sync::Arc::new(AtomicU32::new(relay_delay_seen));
+-    tokio::spawn(viewer_check(peer_id, to_peer, answers_rx, steps_rx, streams_tx, relay_delay.clone()));
++    let retry = RetryPermit::default();
++    let worker = tokio::spawn(viewer_check(
++        peer_id, to_peer, answers_rx, steps_rx, streams_tx,
++        relay_delay.clone(), retry.clone(), first_attempt,
++    ));
+     Viewer {
+         answers,
+         relay_delay,
+-        link: Some(Link { steps, streams }),
++        link: Some(Link { steps, streams, retry, worker }),
++        slow_relay: SlowRelay::default(),
+     }
+ }
+ 
+@@ -580,6 +609,8 @@ async fn viewer_check(
+     mut steps: mpsc::UnboundedReceiver<u32>,
+     streams: mpsc::Sender<Moved>,
+     relay_delay: std::sync::Arc<AtomicU32>,
++    retry: RetryPermit,
++    first_attempt: bool,
+ ) {
+     if !matches!(timeout(SETTINGS_WAIT, viewer_allowed(&peer_id)).await, Ok(true)) {
+         return;
+@@ -619,6 +650,12 @@ async fn viewer_check(
+     log_result("viewer", &checked.found, seen, mine, theirs);
+     let path = match checked.found {
+         Some(path) if answer.version >= 2 => path,
++        // The answer was consumed and no READY was sent. No step from this
++        // round can be mistaken for one belonging to a later exchange.
++        None => {
++            retry.record_miss(first_attempt, answer.version, std::time::Instant::now());
++            return;
++        }
+         _ => return,
+     };
+     let (socket, ready) = if path.addr.is_ipv4() {
+@@ -676,10 +713,15 @@ async fn viewer_check(
+     streams.send(Moved { stream, gate, lease }).await.ok();
+ }
+ 
+-pub fn answer_offer(offer: DirectOffer, mut reply: impl FnMut(Message) + Send + 'static) -> Link {
++pub fn answer_offer(offer: DirectOffer, first_attempt: bool, mut reply: impl FnMut(Message) + Send + 'static) -> Link {
+     let (steps, mut steps_rx) = mpsc::unbounded_channel();
+     let (streams_tx, streams) = mpsc::channel(1);
+-    tokio::spawn(async move {
++    let retry = RetryPermit::default();
++    let retry_for_worker = retry.clone();
++    // The host keeps listening longer than the viewer. Its cooldown starts
++    // before sending the answer, so a legitimate second offer can be accepted.
++    let offered_at = std::time::Instant::now();
++    let worker = tokio::spawn(async move {
+         let mut answer = DirectAnswer::new();
+         answer.version = VERSION.min(offer.version);
+         let peer = parse_candidates(&offer.candidates);
+@@ -710,6 +752,10 @@ pub fn answer_offer(offer: DirectOffer, mut reply: impl FnMut(Message) + Send +
+         };
+         let checked = check(gathered.v4, gathered.v6, peer, &key, window, None, ready).await;
+         log_result("host", &checked.found, seen, mine, theirs);
++        if checked.ready.is_none() {
++            retry_for_worker.record_miss(first_attempt, offer.version, offered_at);
++            return;
++        }
+         let found = checked.found.as_ref().map(|path| (path.addr.is_ipv4(), path.rtt));
+         let (socket, viewer_addr) = match checked.ready {
+             Some(STEP_READY_V4) => (checked.v4, checked.pinged_from_v4),
+@@ -756,7 +802,7 @@ pub fn answer_offer(offer: DirectOffer, mut reply: impl FnMut(Message) + Send +
+             _ => log::info!("[direct] move (host): the direct link did not answer, staying on the relay"),
+         }
+     });
+-    Link { steps, streams }
++    Link { steps, streams, retry, worker }
+ }
+ 
+ async fn drain(socket: &UdpSocket) {
+@@ -1425,6 +1471,52 @@ mod tests {
+         assert!(!clearly_faster(ms(10), ms(0)));
+     }
+ 
++    #[tokio::test]
++    async fn retry_drops_the_probe_worker_with_the_session() {
++        let (steps, _) = mpsc::unbounded_channel();
++        let (_, streams) = mpsc::channel(1);
++        let (started, ready) = tokio::sync::oneshot::channel();
++        let (on_exit, exited) = tokio::sync::oneshot::channel::<()>();
++        let worker = tokio::spawn(async move {
++            let _on_exit = on_exit;
++            started.send(()).unwrap();
++            std::future::pending::<()>().await;
++        });
++        let link = Link { steps, streams, retry: RetryPermit::default(), worker };
++        ready.await.unwrap();
++        drop(link);
++        assert!(timeout(Duration::from_secs(1), exited).await.unwrap().is_err());
++    }
++
++    #[tokio::test]
++    async fn retry_can_reach_a_recovered_udp_path_after_a_bounded_miss() {
++        let (viewer, _) = local_socket().await;
++        let (_silent, addr) = local_socket().await;
++        let first_key = new_key();
++        let lost = check(Some(viewer), None, vec![addr], &first_key, Duration::from_millis(100), None, None).await;
++        assert!(lost.found.is_none() && lost.ready.is_none());
++        let permit = RetryPermit::default();
++        let t = std::time::Instant::now();
++        permit.record_miss(true, VERSION, t);
++        let mut slow = SlowRelay::default();
++        for seconds in 0..30 {
++            assert!(!slow.observe(400, t + Duration::from_secs(seconds)));
++        }
++        assert!(permit.ready(t + Duration::from_secs(30)) && slow.observe(400, t + Duration::from_secs(30)));
++        let (a, a_addr) = local_socket().await;
++        let (b, b_addr) = local_socket().await;
++        let second_key = new_key();
++        let window = Duration::from_secs(1);
++        let (a, b) = tokio::join!(
++            check(Some(a), None, vec![b_addr], &second_key, window, Some(FOUND_GRACE), None),
++            check(Some(b), None, vec![a_addr], &second_key, window, Some(FOUND_GRACE), None),
++        );
++        assert_eq!(b.found.unwrap().addr, a_addr);
++        let path = a.found.unwrap();
++        assert_eq!(path.addr, b_addr);
++        assert!(clearly_faster(path.rtt, Duration::from_millis(400)));
++    }
++
+     #[tokio::test]
+     async fn the_check_waits_a_short_time_for_the_first_relay_report() {
+         let seen = AtomicU32::new(0);
+@@ -1449,7 +1541,12 @@ mod tests {
+         assert_eq!(relay_round_trip(ms(543), 221), Some(ms(221)));
+         assert_eq!(relay_round_trip(ms(90), 221), Some(ms(90)));
+         let (answers, _) = mpsc::unbounded_channel();
+-        let viewer = Viewer { answers, relay_delay: std::sync::Arc::new(AtomicU32::new(0)), link: None };
++        let mut viewer = Viewer {
++            answers,
++            relay_delay: std::sync::Arc::new(AtomicU32::new(0)),
++            link: None,
++            slow_relay: SlowRelay::default(),
++        };
+         viewer.on_relay_delay(0);
+         assert_eq!(viewer.relay_delay.load(Ordering::Relaxed), 0);
+         viewer.on_relay_delay(240);
+diff --git a/src/direct_probe/retry.rs b/src/direct_probe/retry.rs
+new file mode 100644
+index 0000000..4409dd6
+--- /dev/null
++++ b/src/direct_probe/retry.rs
+@@ -0,0 +1,78 @@
++use std::{
++    sync::{Arc, OnceLock},
++    time::{Duration, Instant},
++};
++
++pub(super) const PROTOCOL_VERSION: u32 = 3;
++const SLOW_MS: u32 = 150;
++const WAIT: Duration = Duration::from_secs(30);
++const MAX_SAMPLE_GAP: Duration = Duration::from_secs(5);
++
++#[derive(Clone, Default)]
++pub(super) struct RetryPermit(Arc<OnceLock<Instant>>);
++
++impl RetryPermit {
++    pub(super) fn record_miss(&self, first_attempt: bool, version: u32, now: Instant) {
++        if first_attempt && version >= PROTOCOL_VERSION {
++            let _ = self.0.set(now);
++        }
++    }
++
++    pub(super) fn ready(&self, now: Instant) -> bool {
++        self.0.get().is_some_and(|at| now.saturating_duration_since(*at) >= WAIT)
++    }
++}
++
++#[derive(Default)]
++pub(super) struct SlowRelay {
++    first: Option<Instant>,
++    last: Option<Instant>,
++}
++
++impl SlowRelay {
++    pub(super) fn observe(&mut self, ms: u32, now: Instant) -> bool {
++        if ms < SLOW_MS {
++            *self = Self::default();
++            return false;
++        }
++        if self.last.is_some_and(|at| now.saturating_duration_since(at) > MAX_SAMPLE_GAP) {
++            self.first = None;
++        }
++        self.last = Some(now);
++        now.saturating_duration_since(*self.first.get_or_insert(now)) >= WAIT
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn an_authenticated_first_exchange_can_only_enable_one_later_attempt() {
++        let t = Instant::now();
++        for (first, version) in [(true, 2), (false, 3), (false, 4)] {
++            let permit = RetryPermit::default();
++            permit.record_miss(first, version, t);
++            assert!(!permit.ready(t + WAIT * 2));
++        }
++        let permit = RetryPermit::default();
++        assert!(!permit.ready(t + WAIT));
++        permit.record_miss(true, 3, t);
++        assert!(!permit.ready(t + WAIT - Duration::from_millis(1)));
++        assert!(permit.ready(t + WAIT));
++    }
++
++    #[test]
++    fn sustained_slow_relay_requires_continuous_fresh_reports() {
++        let t = Instant::now();
++        let mut slow = SlowRelay::default();
++        for s in 0..30 {
++            assert!(!slow.observe(400, t + Duration::from_secs(s)));
++        }
++        assert!(slow.observe(400, t + WAIT));
++        assert!(!slow.observe(40, t + WAIT));
++        assert!(!slow.observe(400, t + WAIT + Duration::from_secs(1)));
++        assert!(!slow.observe(400, t + WAIT * 2));
++        assert!(!slow.observe(0, t + WAIT * 3));
++    }
++}
+diff --git a/src/server/connection.rs b/src/server/connection.rs
+index 4ee6f96..d486a58 100644
+--- a/src/server/connection.rs
++++ b/src/server/connection.rs
+@@ -3850,9 +3850,13 @@ impl Connection {
+                         self.send_to_cm(ipc::Data::FileOfferReceived);
+                     }
+                     Some(misc::Union::DirectOffer(offer)) => {
+-                        if self.direct_link.is_none() && self.stream.is_secured() {
++                        let first_attempt = self.direct_link.is_none();
++                        let retry = offer.version >= crate::direct_probe::RETRY_VERSION
++                            && self.direct_link.as_ref().is_some_and(crate::direct_probe::Link::can_retry);
++                        if (first_attempt || retry) && self.stream.is_secured() && self.relayed
++                            && self.is_authed_remote_conn() && !self.stream.reads_moved() {
+                             let mut inner = self.inner.clone();
+-                            self.direct_link = Some(crate::direct_probe::answer_offer(offer, move |msg| inner.send(msg.into())));
++                            self.direct_link = Some(crate::direct_probe::answer_offer(offer, first_attempt, move |msg| inner.send(msg.into())));
+                         }
+                     }
+                     Some(misc::Union::DirectStep(step)) => {

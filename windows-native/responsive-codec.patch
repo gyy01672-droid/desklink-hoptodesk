@@ -1,0 +1,228 @@
+diff --git a/libs/hbb_common/protos/message.proto b/libs/hbb_common/protos/message.proto
+index 053b9a3..dcd42de 100644
+--- a/libs/hbb_common/protos/message.proto
++++ b/libs/hbb_common/protos/message.proto
+@@ -706,6 +706,9 @@ message SupportedDecoding {
+   int32 ability_av1 = 6;
+   CodecAbility i444 = 7;
+   Chroma prefer_chroma = 8;
++  // A single interactive viewer prefers hardware H264, then VP8. Older peers
++  // ignore this extension and see the ordinary H264 preference in field 4.
++  bool prefer_low_latency = 100;
+ }
+ 
+ message OptionMessage {
+diff --git a/libs/hbb_common/src/config.rs b/libs/hbb_common/src/config.rs
+index df85764..08ed479 100644
+--- a/libs/hbb_common/src/config.rs
++++ b/libs/hbb_common/src/config.rs
+@@ -2099,7 +2099,7 @@ impl UserDefaultConfig {
+                 self.get_string(key, "balanced", vec!["best", "low", "custom"])
+             }
+             keys::OPTION_CODEC_PREFERENCE => {
+-                self.get_string(key, "auto", vec!["vp8", "vp9", "av1", "h264", "h265"])
++                self.get_string(key, "auto", vec!["vp8", "vp9", "av1", "h264", "h265", "desklink-responsive"])
+             }
+             keys::OPTION_CUSTOM_IMAGE_QUALITY => self.get_num_string(key, 50.0, 10.0, 0xFFF as f64),
+             keys::OPTION_CUSTOM_FPS => self.get_num_string(key, 30.0, 5.0, 120.0),
+diff --git a/libs/scrap/src/common/codec.rs b/libs/scrap/src/common/codec.rs
+index 0c54b16..8f44a0c 100644
+--- a/libs/scrap/src/common/codec.rs
++++ b/libs/scrap/src/common/codec.rs
+@@ -231,15 +231,14 @@ impl Encoder {
+             _all_support_h265_decoding && (h265vram_encoding || h265hw_encoding.is_some());
+         let mut format = ENCODE_CODEC_FORMAT.lock().unwrap();
+         let preferences: Vec<_> = decodings
+-            .iter()
+-            .filter(|(_, s)| {
+-                s.prefer == PreferCodec::VP9.into()
+-                    || s.prefer == PreferCodec::VP8.into() && vp8_useable
+-                    //|| s.prefer == PreferCodec::AV1.into() && av1_useable
+-                    || s.prefer == PreferCodec::H264.into() && h264_useable
+-                    || s.prefer == PreferCodec::H265.into() && h265_useable
++            .values()
++            .map(|s| viewer_codec_vote(s, decodings.len() == 1, h264_useable, vp8_useable))
++            .filter(|p| {
++                *p == PreferCodec::VP9
++                    || *p == PreferCodec::VP8 && vp8_useable
++                    || *p == PreferCodec::H264 && h264_useable
++                    || *p == PreferCodec::H265 && h265_useable
+             })
+-            .map(|(_, s)| s.prefer)
+             .collect();
+         *USABLE_ENCODING.lock().unwrap() = Some(SupportedEncoding {
+             vp8: vp8_useable,
+@@ -257,11 +256,10 @@ impl Encoder {
+             }
+         }
+         let max_count = counts.iter().map(|(_, count)| *count).max().unwrap_or(0);
+-        let (most_frequent, _) = counts
++        let (preference, _) = counts
+             .into_iter()
+             .find(|(_, count)| *count == max_count)
+-            .unwrap_or((PreferCodec::Auto.into(), 0));
+-        let preference = most_frequent.enum_value_or(PreferCodec::Auto);
++            .unwrap_or((PreferCodec::Auto, 0));
+ 
+         // auto: h265 > h264 > vp9/vp8
+         let mut auto_codec = CodecFormat::VP9;
+@@ -417,7 +415,7 @@ impl Decoder {
+         _luid: Option<i64>,
+         mark_unsupported: &Vec<CodecFormat>,
+     ) -> SupportedDecoding {
+-        let (prefer, prefer_chroma) = Self::preference(id_for_perfer);
++        let (prefer, prefer_chroma, prefer_low_latency) = Self::preference(id_for_perfer);
+ 
+         #[allow(unused_mut)]
+         let mut decoding = SupportedDecoding {
+@@ -432,6 +430,7 @@ impl Decoder {
+             .into(),
+             prefer: prefer.into(),
+             prefer_chroma: prefer_chroma.into(),
++            prefer_low_latency,
+             ..Default::default()
+         };
+         #[cfg(feature = "nativecodec")]
+@@ -806,34 +805,104 @@ impl Decoder {
+         return Ok(false);
+     }
+ 
+-    fn preference(id: Option<&str>) -> (PreferCodec, Chroma) {
++    fn preference(id: Option<&str>) -> (PreferCodec, Chroma, bool) {
+         let id = id.unwrap_or_default();
+         if id.is_empty() {
+-            return (PreferCodec::Auto, Chroma::I420);
++            return (PreferCodec::Auto, Chroma::I420, false);
+         }
+         let options = PeerConfig::load(id).options;
+-        let codec = options
+-            .get("codec-preference")
+-            .map_or("".to_owned(), |c| c.to_owned());
+-        let codec = if codec == "vp8" {
+-            PreferCodec::VP8
+-        } else if codec == "vp9" {
+-            PreferCodec::VP9
+-        //} else if codec == "av1" {
+-        //    PreferCodec::AV1
+-        } else if codec == "h264" {
+-            PreferCodec::H264
+-        } else if codec == "h265" {
+-            PreferCodec::H265
+-        } else {
+-            PreferCodec::Auto
+-        };
++        let (codec, low_latency) = codec_option(options.get("codec-preference").map(String::as_str));
+         let chroma = if options.get("i444") == Some(&"Y".to_string()) {
+             Chroma::I444
+         } else {
+             Chroma::I420
+         };
+-        (codec, chroma)
++        (codec, chroma, low_latency)
++    }
++}
++
++fn codec_option(value: Option<&str>) -> (PreferCodec, bool) {
++    match value {
++        Some("desklink-responsive") => (PreferCodec::H264, true),
++        Some("vp8") => (PreferCodec::VP8, false),
++        Some("vp9") => (PreferCodec::VP9, false),
++        Some("h264") => (PreferCodec::H264, false),
++        Some("h265") => (PreferCodec::H265, false),
++        _ => (PreferCodec::Auto, false),
++    }
++}
++
++fn viewer_codec_vote(
++    viewer: &SupportedDecoding,
++    single_viewer: bool,
++    h264_usable: bool,
++    vp8_usable: bool,
++) -> PreferCodec {
++    let preference = viewer.prefer.enum_value_or(PreferCodec::Auto);
++    if !viewer.prefer_low_latency || preference != PreferCodec::H264 {
++        return preference;
++    }
++    // With a shared encoder only explicit codec choices vote. Auto selection
++    // and the existing hardware/decoder capability checks remain authoritative.
++    match (single_viewer, h264_usable, vp8_usable) {
++        (true, true, _) => PreferCodec::H264,
++        (true, false, true) => PreferCodec::VP8,
++        _ => PreferCodec::Auto,
++    }
++}
++
++#[cfg(test)]
++mod responsive_tests {
++    use super::*;
++    use hbb_common::protobuf::Message;
++
++    fn viewer(preference: PreferCodec, low_latency: bool) -> SupportedDecoding {
++        SupportedDecoding {
++            prefer: preference.into(),
++            prefer_low_latency: low_latency,
++            ..Default::default()
++        }
++    }
++
++    #[test]
++    fn interactive_choice_observes_both_codec_capabilities() {
++        let request = viewer(PreferCodec::H264, true);
++        for (h264, vp8, want) in [
++            (true, true, PreferCodec::H264), (true, false, PreferCodec::H264),
++            (false, true, PreferCodec::VP8), (false, false, PreferCodec::Auto),
++        ] {
++            assert_eq!(viewer_codec_vote(&request, true, h264, vp8), want);
++            assert_eq!(viewer_codec_vote(&request, false, h264, vp8), PreferCodec::Auto);
++        }
++    }
++
++    #[test]
++    fn explicit_viewers_and_recording_keep_the_existing_vote() {
++        for pref in [PreferCodec::VP8, PreferCodec::VP9, PreferCodec::H265,
++                     PreferCodec::H264, PreferCodec::Auto] {
++            assert_eq!(viewer_codec_vote(&viewer(pref, false), false, false, true), pref);
++        }
++        assert_eq!(viewer_codec_vote(&viewer(PreferCodec::Auto, false), true, false, true),
++                   PreferCodec::Auto);
++    }
++
++    #[test]
++    fn preset_values_and_legacy_wire_preference() {
++        for (key, kind) in [(None, PreferCodec::Auto), (Some("auto"), PreferCodec::Auto),
++                            (Some("vp8"), PreferCodec::VP8), (Some("vp9"), PreferCodec::VP9),
++                            (Some("h265"), PreferCodec::H265), (Some("h264"), PreferCodec::H264)] {
++            assert_eq!(codec_option(key), (kind, false));
++        }
++        let (codec, flag) = codec_option(Some("desklink-responsive"));
++        assert_eq!((codec, flag), (PreferCodec::H264, true));
++        // The unchanged wire prefix is field 4 = H264. Old senders omit field 100.
++        let old = [0x20, 0x02];
++        let legacy = SupportedDecoding::parse_from_bytes(&old).unwrap();
++        assert!(!legacy.prefer_low_latency);
++        assert_eq!(legacy.prefer.enum_value_or_default(), PreferCodec::H264);
++        let new = [0x20, 0x02, 0xa0, 0x06, 0x01];
++        assert_eq!(viewer(codec, flag).write_to_bytes().unwrap(), new);
++        assert!(SupportedDecoding::parse_from_bytes(&new).unwrap().prefer_low_latency);
+     }
+ }
+ 
+@@ -1148,4 +1217,4 @@ pub fn test_av1() {
+         });
+     });
+ }
+-*/
+\ No newline at end of file
++*/
+diff --git a/src/server/connection.rs b/src/server/connection.rs
+index 4ee6f96..76d4ae1 100644
+--- a/src/server/connection.rs
++++ b/src/server/connection.rs
+@@ -2669,6 +2669,7 @@ impl Connection {
+         if !recording_forced_or_enabled() {
+             return;
+         }
++        q.prefer_low_latency = false;
+         q.ability_h264 = 0;
+         q.ability_h265 = 0;
+         q.ability_av1 = 0;
