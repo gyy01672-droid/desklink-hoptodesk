@@ -1,0 +1,174 @@
+diff --git a/src/lang/cn.rs b/src/lang/cn.rs
+index e65e1fb..d649784 100644
+--- a/src/lang/cn.rs
++++ b/src/lang/cn.rs
+@@ -145,6 +145,16 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("Custom", "自定义"),
+         ("Show remote cursor", "显示远程光标"),
+         ("Show quality monitor", "显示质量监测"),
++        ("Copy performance diagnostics", "复制性能诊断"),
++        ("Session performance", "本次会话性能"),
++        ("Connection path", "连接线路"),
++        ("Host measured round-trip time", "被控端测得的往返延迟"),
++        ("Requested frame rate limit", "主控端设置的帧率上限"),
++        ("Decoded output (one video stream)", "单路视频解码帧率"),
++        ("Video bitrate target", "视频目标码率"),
++        ("Receive rate", "接收速率"),
++        ("Pending or under 1 ms", "等待采样或低于 1 毫秒"),
++        ("Clipboard write failed", "写入本机剪贴板失败"),
+         ("Disable clipboard", "禁用剪贴板"),
+         ("Lock after session end", "会话结束后锁定远程电脑"),
+         ("Insert", "插入"),
+diff --git a/src/ui/header.tis b/src/ui/header.tis
+index 168d303..236cf5a 100644
+--- a/src/ui/header.tis
++++ b/src/ui/header.tis
+@@ -323,6 +323,7 @@ class Header: Reactor.Component {
+                 {keyboard_enabled ? <li #view-only .toggle-option title={translate("View only")}><span .toggle-track><span .toggle-knob /></span>{translate('View only')}</li> : ""}
+                 {!cursor_embedded && <li #show-remote-cursor .toggle-option title={translate("Show remote cursor")}><span .toggle-track><span .toggle-knob /></span>{translate('Show remote cursor')}</li>}
+                 <li #show-quality-monitor .toggle-option title={translate("Show quality monitor")}><span .toggle-track><span .toggle-knob /></span>{translate('Show quality monitor')}</li>
++                <li #copy-performance-report>{translate("Copy performance diagnostics")}</li>
+                 {handler.version_cmp(pi.version, '1.46.6') >= 0 && (pi.platform == "Windows" || pi.platform == "Mac OS" || pi.platform == "Linux") ? <li #show-my-cursor .toggle-option title={translate("Show my cursor")}><span .toggle-track><span .toggle-knob /></span>{translate('Show my cursor')}</li> : ""}
+                 {audio_enabled ? <li #disable-audio .toggle-option title={translate("Mute")}><span .toggle-track><span .toggle-knob /></span>{translate('Mute')}</li> : ""}
+                 {(is_win && pi.platform == "Windows") && file_enabled ? <li #enable-file-copy-paste .toggle-option title={translate("Enable file copy and paste")}><span .toggle-track><span .toggle-knob /></span>{translate('Enable file copy and paste')}</li> : ""}
+@@ -636,6 +637,8 @@ class Header: Reactor.Component {
+             togglePrivacyMode(me.id);
+         } else if (me.id == "show-quality-monitor") {
+             toggleQualityMonitor(me.id);
++        } else if (me.id == "copy-performance-report") {
++            copyPerformanceReport();
+         } else if (me.id == "i444") {
+             toggleI444(me.id);
+         } else if (me.attributes.hasClass("toggle-option")) {
+@@ -1438,6 +1441,7 @@ handler.handleLocalShortcut = function(name) {
+ }
+ 
+ handler.setConnectionType = function(secured, direct, security_numbers, avatar_image) {
++    qualityMonitorData = [];
+     header.secure_connection = secured;
+     header.direct_connection = direct;
+     header.security_numbers = security_numbers;
+diff --git a/src/ui/remote.rs b/src/ui/remote.rs
+index fa264e5..2528043 100644
+--- a/src/ui/remote.rs
++++ b/src/ui/remote.rs
+@@ -365,7 +365,7 @@ impl InvokeUiSession for RemoteUiHandler {
+                 status
+                     .fps
+                     .iter()
+-                    .next()
++                    .min_by_key(|(display, _)| **display)
+                     .map_or(Value::null(), |(_, v)| (*v).into()),
+                 status.delay.map_or(Value::null(), |it| it.into()),
+                 status.target_bitrate.map_or(Value::null(), |it| it.into()),
+@@ -857,6 +857,7 @@ impl wireui::EventHandler for RemoteSession {
+         fn set_option(String, String);
+         fn input_os_password(String, bool);
+         fn type_clipboard();
++        fn copy_performance_report(String);
+         fn save_close_state(String, String);
+         fn is_file_transfer();
+         fn is_port_forward();
+@@ -1107,6 +1108,10 @@ impl RemoteSession {
+         self.session.switch_display(display);
+     }
+ 
++    fn copy_performance_report(&self, report: String) -> bool {
++        super::copy_text(&report)
++    }
++
+     fn type_clipboard(&self) {
+         let text = arboard::Clipboard::new()
+             .and_then(|mut c| c.get_text())
+diff --git a/src/ui/remote.tis b/src/ui/remote.tis
+index e6850cb..99bea65 100644
+--- a/src/ui/remote.tis
++++ b/src/ui/remote.tis
+@@ -1313,6 +1313,46 @@ function self.closing() {
+ var qualityMonitor;
+ var qualityMonitorData = [];
+ 
++function qualitySample(value, unit) {
++    if (value === null || value === undefined) return "-";
++    return "" + value + unit;
++}
++
++function qualityReceiveRate() {
++    var speed = qualityMonitorData[0];
++    return speed ? speed.replace("kB/s", " KiB/s") : "-";
++}
++
++function qualityRtt() {
++    var delay = qualityMonitorData[2];
++    // The host sends 0 before its first reply; sub-millisecond RTT also rounds to 0.
++    if (delay === 0) return translate("Pending or under 1 ms");
++    return qualitySample(delay, " ms");
++}
++
++function buildPerformanceReport() {
++    var direct = header.direct_connection;
++    var route = "-";
++    if (direct === true) route = translate("Direct Connection");
++    if (direct === false) route = translate("Relay Connection");
++    return [
++        translate("Session performance"),
++        translate("Connection path") + ": " + route,
++        translate("Host measured round-trip time") + ": " + qualityRtt(),
++        translate("Requested frame rate limit") + ": " + qualitySample(handler.get_custom_fps(), " FPS"),
++        translate("Decoded output (one video stream)") + ": " + qualitySample(qualityMonitorData[1], " FPS"),
++        translate("Video bitrate target") + ": " + qualitySample(qualityMonitorData[3], " kbps"),
++        translate("Codec") + ": " + qualitySample(qualityMonitorData[4], ""),
++        translate("Receive rate") + ": " + qualityReceiveRate(),
++        translate("Session received") + ": " + qualitySample(qualityMonitorData[5], "")
++    ].join("\r\n");
++}
++
++function copyPerformanceReport() {
++    var copied = handler.copy_performance_report(buildPerformanceReport());
++    showSessionToast(translate(copied ? "Copied" : "Clipboard write failed"), 1800ms);
++}
++
+ class QualityMonitor: Reactor.Component
+ {
+     function this() {
+@@ -1325,22 +1365,22 @@ class QualityMonitor: Reactor.Component
+     function render() {
+         return <div >
+             <div>
+-                Speed: {qualityMonitorData[0]}
++                {translate("Receive rate")}: {qualityReceiveRate()}
+             </div>
+             <div>
+                 {translate("Session received")}: {qualityMonitorData[5] || "-"}
+             </div>
+             <div>
+-                FPS: {qualityMonitorData[1]}
++                {translate("Decoded output (one video stream)")}: {qualitySample(qualityMonitorData[1], " FPS")}
+             </div>
+             <div>
+-                Delay: {qualityMonitorData[2]} ms
++                {translate("Host measured round-trip time")}: {qualityRtt()}
+             </div>
+             <div>
+-                Target Bitrate: {qualityMonitorData[3]}kb
++                {translate("Video bitrate target")}: {qualitySample(qualityMonitorData[3], " kbps")}
+             </div>
+             <div>
+-                Codec: {qualityMonitorData[4]}
++                {translate("Codec")}: {qualitySample(qualityMonitorData[4], "")}
+             </div>
+         </div>;
+     }
+@@ -1419,9 +1459,9 @@ $(#draw-palette).content(<DrawPalette />);
+ handler.updateQualityStatus = function(speed, fps, delay, bitrate, codec_format, session_received) {
+     if (is_file_transfer || is_port_forward || is_terminal) return;
+     speed ? qualityMonitorData[0] = speed:null;
+-    fps ? qualityMonitorData[1] = fps:null;
+-    delay ? qualityMonitorData[2] = delay:null;
+-    bitrate ? qualityMonitorData[3] = bitrate:null;
++    if (fps !== null && fps !== undefined) qualityMonitorData[1] = fps;
++    if (delay !== null && delay !== undefined) qualityMonitorData[2] = delay;
++    if (bitrate !== null && bitrate !== undefined) qualityMonitorData[3] = bitrate;
+     codec_format ? qualityMonitorData[4] = codec_format:null;
+     if (session_received) qualityMonitorData[5] = session_received;
+     qualityMonitor.update();

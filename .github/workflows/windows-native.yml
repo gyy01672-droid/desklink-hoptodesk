@@ -35,7 +35,7 @@ jobs:
           git submodule update --init --depth 1 upstream/hoptodesk
           if ($LASTEXITCODE) {throw 'Source checkout failed'}
           if ((git -C upstream/hoptodesk rev-parse HEAD) -ne 'cc56380b38c962770ed9e0d704235c94f1881248') {throw 'Unexpected source revision'}
-          foreach ($file in 'windows-native/performance.patch','windows-native/session-traffic.patch') {
+          foreach ($file in 'windows-native/performance.patch','windows-native/session-traffic.patch','windows-native/quality-diagnostics.patch') {
             git -C upstream/hoptodesk apply (Resolve-Path $file)
             if ($LASTEXITCODE) {throw "Patch did not apply: $file"}
           }
@@ -106,6 +106,9 @@ jobs:
           $result = & $exe --version | Out-String
           if ($LASTEXITCODE -ne 0 -or $result -notmatch '1\.46\.88') {throw "Version check failed: $result"}
           (Get-FileHash $exe).Hash
+      - name: Check the self-contained Windows GUI
+        shell: pwsh
+        run: ./windows-native/ui-smoke.ps1 -Executable ./upstream/hoptodesk/target/release/hoptodesk.exe
       - name: Exercise the Windows QoS regression cases
         working-directory: upstream/hoptodesk
         shell: pwsh
@@ -113,10 +116,19 @@ jobs:
           cargo test --locked --release --lib --features packui,nativecodec server::video_qos::tests::
           if ($LASTEXITCODE) {throw 'QoS regressions failed'}
           cargo test --locked --release --lib --features packui,nativecodec client::traffic::tests::
+      - name: Stage executable and notices
+        shell: pwsh
+        run: |
+          $null = New-Item -ItemType Directory -Force native-artifact/licenses
+          Copy-Item upstream/hoptodesk/target/release/hoptodesk.exe native-artifact/
+          Copy-Item upstream/hoptodesk/LICENSE native-artifact/licenses/HopToDesk-AGPL.txt
+          Copy-Item upstream/hoptodesk/libs/htd-vdd/LICENSE native-artifact/licenses/Virtual-Display-MIT.txt
+          Copy-Item upstream/hoptodesk/wireui/LICENSE native-artifact/licenses/WireUI-MIT.txt
+          Copy-Item upstream/hoptodesk/wireui/THIRD-PARTY-NOTICES.md native-artifact/licenses/WireUI-third-party.md
       - uses: actions/upload-artifact@v4
         if: ${{ hashFiles('windows-native/performance.patch') != '' }}
         with:
           name: hoptodesk-windows-performance
-          path: upstream/hoptodesk/target/release/hoptodesk.exe
+          path: native-artifact/
           if-no-files-found: error
           retention-days: 7
